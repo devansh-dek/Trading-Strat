@@ -68,8 +68,8 @@ OSMIUM_SOFT_LIMIT = 30
 # mid, so we are happy to buy at or above mid and even to pay a tick.
 # We bias our entire book upward: buys are aggressive, sells retreat.
 PEPPER_TARGET_POSITION = 50      # desired directional inventory
-PEPPER_AGGRESSIVE_EDGE = 3       # accept prices up to fair + this to grow long
-PEPPER_SELL_EDGE = 5             # only sell at/above fair + this
+PEPPER_AGGRESSIVE_EDGE = 10      # buy aggressively -- we know mid drifts up ~1000/day
+PEPPER_SELL_EDGE = 20            # effectively never sell unless market wildly overshoots
 PEPPER_VOLUME_FILTER = 15        # big-order volume threshold for filtered mid
 PEPPER_DRIFT_BIAS = 0.1          # ticks added to fair per tick traded
 PEPPER_MAX_DRIFT_BIAS = 3.0      # cap on the drift bias we bake in
@@ -238,7 +238,7 @@ def _pepper_orders(
     remaining_buy = limit - position
     remaining_sell = limit + position
 
-    # --- 1. Aggressive buying on any cheap ask -----------------------------
+    # --- 1. Aggressively buy every ask up to fair + AGGRESSIVE_EDGE --------
     if depth.sell_orders and remaining_buy > 0:
         for ask_price in sorted(depth.sell_orders.keys()):
             if ask_price > fair + PEPPER_AGGRESSIVE_EDGE:
@@ -252,26 +252,24 @@ def _pepper_orders(
             if remaining_buy <= 0:
                 break
 
-    # --- 2. Passive bid above the best cloud bid ---------------------------
+    # --- 2. Passive bid right at best bid + 1 -------------------------------
     if remaining_buy > 0 and depth.buy_orders:
         best_bid = max(depth.buy_orders.keys())
-        bid_price = min(int(math.floor(fair)) - 1, best_bid + 1)
-        bid_price = max(bid_price, best_bid + 1)
-        # Prevent crossing the book: our bid must be strictly below any ask.
+        bid_price = best_bid + 1
         if depth.sell_orders:
             bid_price = min(bid_price, min(depth.sell_orders.keys()) - 1)
         orders.append(Order(PEPPER, bid_price, remaining_buy))
+    elif remaining_buy > 0:
+        orders.append(Order(PEPPER, int(round(fair)), remaining_buy))
 
-    # --- 3. Passive sell above fair so we still bank spread on overshoot ---
-    if remaining_sell > 0:
+    # --- 3. Passive sell only at an extreme premium ------------------------
+    # We are here to ride the uptrend, so only release inventory if the
+    # market overshoots fair by a wide margin.
+    if remaining_sell > 0 and position > 0:
         ask_price = int(math.ceil(fair + PEPPER_SELL_EDGE))
-        # never cross our own bid
         if depth.buy_orders:
             ask_price = max(ask_price, max(depth.buy_orders.keys()) + 1)
-        # Limit the sell size: we only want to release inventory, not
-        # flip short, because the trend will keep running.
-        max_sell = max(position, 0) + 10  # small extra room if market overshoots
-        qty = min(remaining_sell, max_sell)
+        qty = min(remaining_sell, position)
         if qty > 0:
             orders.append(Order(PEPPER, ask_price, -qty))
 
