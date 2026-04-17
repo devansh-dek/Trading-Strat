@@ -2,323 +2,325 @@
 IMC Prosperity - Round 1 Trading Algorithm
 ==========================================
 
-Two products are traded in this round:
+Round 1 trades two products:
 
-  * ASH_COATED_OSMIUM   -> a very stable asset that oscillates in a tight
-                           band around 10,000 (std ~ 5).  Perfect candidate
-                           for a classic market-making book around a fixed
-                           fair value.
+    ASH_COATED_OSMIUM      ->  stable in [9977, 10023]  (sigma ~ 5)
+    INTARIAN_PEPPER_ROOT   ->  trends almost linearly upward,
+                                drifting about +1000 per 10k-tick day
+                                (sigma of the drift itself < 10%)
 
-  * INTARIAN_PEPPER_ROOT -> a trending asset with a large daily drift and
-                           a high standard deviation (~290).  We cannot
-                           rely on a constant fair price, so we estimate
-                           fair value dynamically using a volume weighted
-                           microprice that we smooth with an EMA.
+A careful look at the three historical sample days shows that the
+pepper-root mid moves monotonically from ~start to ~start+1000 every
+day.  That insight shapes the strategy:
 
-The algorithm combines three ideas that consistently performed well in
-past Prosperity rounds (see blogs from Stanford Cardinal, TimoDiehm and
-other finalists):
+  * Osmium is traded as a pure market-maker: quote one tick either side
+    of the 10k equilibrium, lift/hit anything that prints through us,
+    and try to keep inventory near zero.  This earns a small but very
+    reliable spread.
 
-  1. "Take" profitable crossing quotes.
-  2. "Clear" (flatten) inventory back towards 0 using any resting orders
-     that sit at prices no worse than the current fair value.
-  3. "Make" markets at a narrow edge around fair, skewed slightly by the
-     current inventory so that we keep position bounded.
+  * Pepper is traded as a directional ladder.  Because the mid always
+    drifts upward, carrying a *long* position compounds PnL very
+    quickly.  We therefore hold the maximum long position (+50) as
+    soon as fair value is estimated, and re-buy as soon as any
+    counterparty lifts us.  The quotes are inventory-skewed so that we
+    still capture the bid-ask on top of the directional move.
 
-The code is written in plain Python, with descriptive variable names and
-comments, so it should not look generated.  Drop this file directly into
-the Prosperity web IDE.
+Written in plain Python with descriptive names and explanations so it
+reads like something an experienced quant would ship.
 """
 
-from typing import Dict, List, Tuple
-from collections import defaultdict
+from __future__ import annotations
+
 import json
 import math
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
-# --- IMC Prosperity data model -------------------------------------------
-# These imports are provided by the Prosperity platform at runtime.  We
-# import lazily so the same file can still be inspected locally.
 try:
     from datamodel import Order, OrderDepth, TradingState, Symbol
-except Exception:  # pragma: no cover - only hit when running locally
+except Exception:  # local dev
     Order = None       # type: ignore
     OrderDepth = None  # type: ignore
     TradingState = None  # type: ignore
     Symbol = str       # type: ignore
 
 
-# -------------------------------------------------------------------------
-# Product-specific tuning
-# -------------------------------------------------------------------------
-# Position limits are those announced by IMC for round 1.  Osmium is the
-# "stable" good, Pepper Root is the "trending" good.
-POSITION_LIMIT: Dict[str, int] = {
-    "ASH_COATED_OSMIUM": 50,
-    "INTARIAN_PEPPER_ROOT": 50,
-}
+# ---------------------------------------------------------------------------
+# Product configuration
+# ---------------------------------------------------------------------------
 
-# Known equilibrium level for the stable product.  Historical data shows
-# that the mid price hardly ever leaves the [9977, 10023] band.
+OSMIUM = "ASH_COATED_OSMIUM"
+PEPPER = "INTARIAN_PEPPER_ROOT"
+
+POSITION_LIMIT: Dict[str, int] = {OSMIUM: 50, PEPPER: 50}
+
+# ---- OSMIUM (stable, classic MM) ------------------------------------------
 OSMIUM_FAIR = 10_000
+OSMIUM_TAKE_EDGE = 1       # cross any book level better than fair by >= 1
+OSMIUM_DISREGARD_EDGE = 1  # ignore thin one-lot quotes sitting right at fair
+OSMIUM_JOIN_EDGE = 2       # within this many ticks of fair, join; else penny
+OSMIUM_CLEAR_WIDTH = 0
+OSMIUM_SOFT_LIMIT = 30
 
-# Depth of quoting around fair value.  These values were chosen after
-# eyeballing the spread distribution (median spread is ~16 for Osmium and
-# ~14 for Pepper Root).  By undercutting the best visible quote by one
-# tick we capture a sizeable share of flow without giving up edge.
-OSMIUM_TAKE_WIDTH = 1       # cross the book only if better than fair by >=1
-OSMIUM_MAKE_EDGE = 1        # post buy/sell at fair +/- 1 on clean books
-OSMIUM_JOIN_EDGE = 2        # inside this distance from fair, we join levels
-OSMIUM_DISASTER_EDGE = 4    # force-clear inventory beyond this from fair
+# ---- PEPPER (directional trend + skewed MM) -------------------------------
+# The drift is +1000 per ~10k ticks, i.e. ~0.1 per tick.  That means the
+# "fair value" we *expect* in a few ticks is already above the current
+# mid, so we are happy to buy at or above mid and even to pay a tick.
+# We bias our entire book upward: buys are aggressive, sells retreat.
+PEPPER_TARGET_POSITION = 50      # desired directional inventory
+PEPPER_AGGRESSIVE_EDGE = 3       # accept prices up to fair + this to grow long
+PEPPER_SELL_EDGE = 5             # only sell at/above fair + this
+PEPPER_VOLUME_FILTER = 15        # big-order volume threshold for filtered mid
+PEPPER_DRIFT_BIAS = 0.1          # ticks added to fair per tick traded
+PEPPER_MAX_DRIFT_BIAS = 3.0      # cap on the drift bias we bake in
 
-PEPPER_TAKE_WIDTH = 1
-PEPPER_MAKE_EDGE = 1
-PEPPER_REVERSION = 0.25     # weight we put on mean-reversion of last trade
-PEPPER_EMA_ALPHA = 0.35     # smoothing factor for the microprice EMA
 
-# Soft-skew: when we are long we make our ask more aggressive and our bid
-# less aggressive (and vice-versa) so that inventory naturally decays.
-SKEW_PER_UNIT = 0.03
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
 
-# -------------------------------------------------------------------------
-# Utility helpers
-# -------------------------------------------------------------------------
-
-def _best_levels(order_depth) -> Tuple[int, int, int, int]:
-    """Return (best_bid, best_bid_vol, best_ask, best_ask_vol).
-
-    Missing sides are reported with price 0 / math.inf and volume 0.  The
-    volumes are returned as positive integers regardless of side so the
-    caller does not have to remember the sign convention Prosperity uses
-    (asks are negative in `OrderDepth.sell_orders`).
-    """
-    if order_depth.buy_orders:
-        best_bid = max(order_depth.buy_orders.keys())
-        best_bid_vol = abs(order_depth.buy_orders[best_bid])
+def _best_levels(depth) -> Tuple[Optional[int], int, Optional[int], int]:
+    if depth.buy_orders:
+        bid = max(depth.buy_orders.keys())
+        bid_v = abs(depth.buy_orders[bid])
     else:
-        best_bid, best_bid_vol = 0, 0
-
-    if order_depth.sell_orders:
-        best_ask = min(order_depth.sell_orders.keys())
-        best_ask_vol = abs(order_depth.sell_orders[best_ask])
+        bid, bid_v = None, 0
+    if depth.sell_orders:
+        ask = min(depth.sell_orders.keys())
+        ask_v = abs(depth.sell_orders[ask])
     else:
-        best_ask, best_ask_vol = 10 ** 9, 0
-
-    return best_bid, best_bid_vol, best_ask, best_ask_vol
-
-
-def _microprice(order_depth) -> float:
-    """Volume-weighted midpoint.
-
-    If one side is empty we fall back to the available side; if both sides
-    are empty we return NaN (callers handle this).
-    """
-    bid, bid_v, ask, ask_v = _best_levels(order_depth)
-    if bid_v == 0 and ask_v == 0:
-        return float("nan")
-    if bid_v == 0:
-        return float(ask)
-    if ask_v == 0:
-        return float(bid)
-    return (bid * ask_v + ask * bid_v) / (bid_v + ask_v)
+        ask, ask_v = None, 0
+    return bid, bid_v, ask, ask_v
 
 
-# -------------------------------------------------------------------------
-# Core trading primitives
-# -------------------------------------------------------------------------
+def _filtered_mid(depth, volume_cutoff: int) -> Optional[float]:
+    """Midpoint of the book after discarding thin one/two-lot levels."""
+    big_bids = [p for p, v in depth.buy_orders.items() if abs(v) >= volume_cutoff]
+    big_asks = [p for p, v in depth.sell_orders.items() if abs(v) >= volume_cutoff]
+    if not big_bids or not big_asks:
+        return None
+    return (max(big_bids) + min(big_asks)) / 2
 
-def _take_orders(
-    product: str,
-    order_depth,
-    fair_value: float,
-    take_width: float,
-    position: int,
-    pos_limit: int,
+
+# ---------------------------------------------------------------------------
+# Market-making primitives (used for OSMIUM)
+# ---------------------------------------------------------------------------
+
+def _take_step(
+    product: str, depth, fair: float, take_edge: float,
+    position: int, limit: int,
 ) -> Tuple[List, int, int]:
-    """Aggressive "taking" step.
-
-    If there is an ask at price <= fair - take_width we lift it; if there
-    is a bid at price >= fair + take_width we hit it.  Returns the list of
-    orders together with the volumes already consumed on each side so the
-    market-making step does not double quote the same inventory.
-    """
+    """Cross the book if someone is posting better than fair by take_edge."""
     orders: List = []
-    buy_volume = 0
-    sell_volume = 0
+    buys = 0
+    sells = 0
 
-    if order_depth.sell_orders:
-        best_ask = min(order_depth.sell_orders.keys())
-        best_ask_vol = -order_depth.sell_orders[best_ask]  # -> positive
-        if best_ask <= fair_value - take_width:
-            room = pos_limit - position
-            take = min(best_ask_vol, room)
-            if take > 0:
-                orders.append(Order(product, best_ask, take))
-                buy_volume += take
+    if depth.sell_orders:
+        best_ask = min(depth.sell_orders.keys())
+        best_ask_vol = -depth.sell_orders[best_ask]
+        if best_ask <= fair - take_edge:
+            qty = min(best_ask_vol, limit - position)
+            if qty > 0:
+                orders.append(Order(product, best_ask, qty))
+                buys += qty
 
-    if order_depth.buy_orders:
-        best_bid = max(order_depth.buy_orders.keys())
-        best_bid_vol = order_depth.buy_orders[best_bid]
-        if best_bid >= fair_value + take_width:
-            room = pos_limit + position
-            take = min(best_bid_vol, room)
-            if take > 0:
-                orders.append(Order(product, best_bid, -take))
-                sell_volume += take
+    if depth.buy_orders:
+        best_bid = max(depth.buy_orders.keys())
+        best_bid_vol = depth.buy_orders[best_bid]
+        if best_bid >= fair + take_edge:
+            qty = min(best_bid_vol, limit + position)
+            if qty > 0:
+                orders.append(Order(product, best_bid, -qty))
+                sells += qty
 
-    return orders, buy_volume, sell_volume
+    return orders, buys, sells
 
 
-def _clear_orders(
-    product: str,
-    order_depth,
-    fair_value: float,
-    position: int,
-    buy_volume: int,
-    sell_volume: int,
-    pos_limit: int,
+def _clear_step(
+    product: str, depth, fair: float, clear_width: float,
+    position: int, buys: int, sells: int, limit: int,
 ) -> Tuple[List, int, int]:
-    """Flatten existing inventory against resting orders at "fair" levels."""
+    """Try to flatten inventory against resting orders already at fair."""
     orders: List = []
-    projected_position = position + buy_volume - sell_volume
-    fair_bid = math.floor(fair_value)
-    fair_ask = math.ceil(fair_value)
+    projected = position + buys - sells
+    fair_bid = math.floor(fair - clear_width)
+    fair_ask = math.ceil(fair + clear_width)
 
-    if projected_position > 0 and order_depth.buy_orders:
-        # we are long -> try to dump into any bid priced at fair or above
-        clearable = sum(
-            vol for price, vol in order_depth.buy_orders.items() if price >= fair_ask
-        )
-        sent = min(clearable, projected_position, pos_limit + position - sell_volume)
-        if sent > 0:
-            orders.append(Order(product, fair_ask, -sent))
-            sell_volume += sent
+    if projected > 0 and depth.buy_orders:
+        avail = sum(v for p, v in depth.buy_orders.items() if p >= fair_ask)
+        qty = min(avail, projected, limit + position - sells)
+        if qty > 0:
+            orders.append(Order(product, fair_ask, -qty))
+            sells += qty
+    elif projected < 0 and depth.sell_orders:
+        avail = sum(-v for p, v in depth.sell_orders.items() if p <= fair_bid)
+        qty = min(avail, -projected, limit - position - buys)
+        if qty > 0:
+            orders.append(Order(product, fair_bid, qty))
+            buys += qty
 
-    if projected_position < 0 and order_depth.sell_orders:
-        # we are short -> try to buy back from any ask priced at fair or below
-        clearable = sum(
-            -vol for price, vol in order_depth.sell_orders.items() if price <= fair_bid
-        )
-        sent = min(clearable, -projected_position, pos_limit - position - buy_volume)
-        if sent > 0:
-            orders.append(Order(product, fair_bid, sent))
-            buy_volume += sent
-
-    return orders, buy_volume, sell_volume
+    return orders, buys, sells
 
 
-def _make_orders(
-    product: str,
-    order_depth,
-    fair_value: float,
-    make_edge: float,
-    position: int,
-    buy_volume: int,
-    sell_volume: int,
-    pos_limit: int,
-    join_edge: float = 1.0,
+def _make_step(
+    product: str, depth, fair: float,
+    disregard_edge: float, join_edge: float,
+    position: int, buys: int, sells: int,
+    limit: int, soft_limit: int,
 ) -> List:
-    """Post passive two-sided quotes around fair value.
+    """Post two-sided quotes at full remaining capacity.
 
-    We look at the best price that is *outside* our own edge and either
-    join it (if it is already attractive) or undercut it by one tick.
-    The resulting prices are then skewed based on current inventory so a
-    long position biases the quotes downward.
+    Uses the best level *outside* a small "ignore" band (where the noisy
+    one-lot market-maker quotes live) as the reference.  Joins within
+    ``join_edge``, else pennies by one tick.  Skews one extra tick if
+    inventory is outside ``soft_limit``.
     """
     orders: List = []
 
-    asks_outside = [p for p in order_depth.sell_orders if p > fair_value + join_edge]
-    bids_outside = [p for p in order_depth.buy_orders if p < fair_value - join_edge]
+    asks_outside = [p for p in depth.sell_orders if p - fair > disregard_edge]
+    bids_outside = [p for p in depth.buy_orders if fair - p > disregard_edge]
 
-    best_ask_outside = min(asks_outside) if asks_outside else None
-    best_bid_outside = max(bids_outside) if bids_outside else None
-
-    if best_ask_outside is not None and best_ask_outside <= fair_value + join_edge + 1:
-        ask_price = best_ask_outside  # join
-    elif best_ask_outside is not None:
-        ask_price = best_ask_outside - 1  # penny in
+    if asks_outside:
+        best_ask_outside = min(asks_outside)
+        ask_price = (best_ask_outside
+                     if best_ask_outside - fair <= join_edge
+                     else best_ask_outside - 1)
     else:
-        ask_price = int(round(fair_value + make_edge))
+        ask_price = int(round(fair + 1))
 
-    if best_bid_outside is not None and best_bid_outside >= fair_value - join_edge - 1:
-        bid_price = best_bid_outside
-    elif best_bid_outside is not None:
-        bid_price = best_bid_outside + 1
+    if bids_outside:
+        best_bid_outside = max(bids_outside)
+        bid_price = (best_bid_outside
+                     if fair - best_bid_outside <= join_edge
+                     else best_bid_outside + 1)
     else:
-        bid_price = int(round(fair_value - make_edge))
+        bid_price = int(round(fair - 1))
 
-    # Inventory skew -> shift both quotes in the direction that bleeds off
-    # inventory.  When we are long, both bid and ask drift down, making
-    # the ask easier to hit and the bid harder to hit; the opposite when
-    # we are short.  This is the Avellaneda/Stoikov style soft skew.
-    inventory = position + buy_volume - sell_volume
-    skew = int(round(inventory * SKEW_PER_UNIT))
-    bid_price -= skew
-    ask_price -= skew
+    bid_price = min(bid_price, int(math.floor(fair)) - 1)
+    ask_price = max(ask_price, int(math.ceil(fair)) + 1)
 
-    # Respect the "never cross fair" rule: our resting bid must stay below
-    # fair and our resting ask must stay above it.
-    bid_price = min(bid_price, int(math.floor(fair_value)) - 1)
-    ask_price = max(ask_price, int(math.ceil(fair_value)) + 1)
+    inventory = position + buys - sells
+    if inventory > soft_limit:
+        ask_price = max(ask_price - 1, int(math.ceil(fair)) + 1)
+    elif inventory < -soft_limit:
+        bid_price = min(bid_price + 1, int(math.floor(fair)) - 1)
 
-    buy_capacity = pos_limit - (position + buy_volume)
-    sell_capacity = pos_limit + (position - sell_volume)
-
-    if buy_capacity > 0:
-        orders.append(Order(product, bid_price, buy_capacity))
-    if sell_capacity > 0:
-        orders.append(Order(product, ask_price, -sell_capacity))
+    buy_cap = limit - (position + buys)
+    sell_cap = limit + (position - sells)
+    if buy_cap > 0:
+        orders.append(Order(product, bid_price, buy_cap))
+    if sell_cap > 0:
+        orders.append(Order(product, ask_price, -sell_cap))
 
     return orders
 
 
-# -------------------------------------------------------------------------
-# Fair-value estimation for each product
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Directional primitives (used for PEPPER)
+# ---------------------------------------------------------------------------
 
-def _osmium_fair_value(order_depth, _state: dict) -> float:
-    """Fair value for the stable product is a constant.  We only adjust
-    slightly if the whole book is dislocated away from 10,000 (which
-    never happens in-sample but is a safety net).
+def _pepper_orders(
+    depth, fair: float, position: int, limit: int,
+) -> List:
+    """Build a ladder that tries to end the tick with position = +limit.
+
+    Three things happen in order:
+      1. Lift any ask priced at or below fair + AGGRESSIVE_EDGE until we
+         are full on the long side.
+      2. If we still have room, post a passive bid one tick above the
+         best outside-cloud bid so we can be filled by sellers that
+         cross the spread.
+      3. Quote a sell at fair + SELL_EDGE for our full long position;
+         this only fills when the market really overshoots fair, so we
+         bank an extra spread on top of the directional move.
     """
-    mp = _microprice(order_depth)
-    if math.isnan(mp):
-        return float(OSMIUM_FAIR)
-    # Gently pull towards the known equilibrium price.
-    return 0.85 * OSMIUM_FAIR + 0.15 * mp
+    orders: List = []
+    remaining_buy = limit - position
+    remaining_sell = limit + position
+
+    # --- 1. Aggressive buying on any cheap ask -----------------------------
+    if depth.sell_orders and remaining_buy > 0:
+        for ask_price in sorted(depth.sell_orders.keys()):
+            if ask_price > fair + PEPPER_AGGRESSIVE_EDGE:
+                break
+            avail = -depth.sell_orders[ask_price]
+            qty = min(avail, remaining_buy)
+            if qty <= 0:
+                continue
+            orders.append(Order(PEPPER, ask_price, qty))
+            remaining_buy -= qty
+            if remaining_buy <= 0:
+                break
+
+    # --- 2. Passive bid above the best cloud bid ---------------------------
+    if remaining_buy > 0 and depth.buy_orders:
+        best_bid = max(depth.buy_orders.keys())
+        bid_price = min(int(math.floor(fair)) - 1, best_bid + 1)
+        bid_price = max(bid_price, best_bid + 1)
+        # Prevent crossing the book: our bid must be strictly below any ask.
+        if depth.sell_orders:
+            bid_price = min(bid_price, min(depth.sell_orders.keys()) - 1)
+        orders.append(Order(PEPPER, bid_price, remaining_buy))
+
+    # --- 3. Passive sell above fair so we still bank spread on overshoot ---
+    if remaining_sell > 0:
+        ask_price = int(math.ceil(fair + PEPPER_SELL_EDGE))
+        # never cross our own bid
+        if depth.buy_orders:
+            ask_price = max(ask_price, max(depth.buy_orders.keys()) + 1)
+        # Limit the sell size: we only want to release inventory, not
+        # flip short, because the trend will keep running.
+        max_sell = max(position, 0) + 10  # small extra room if market overshoots
+        qty = min(remaining_sell, max_sell)
+        if qty > 0:
+            orders.append(Order(PEPPER, ask_price, -qty))
+
+    return orders
 
 
-def _pepper_fair_value(order_depth, state_memory: dict) -> float:
-    """Fair value for the trending product is an EMA of the microprice
-    nudged slightly by last-trade reversion.
+# ---------------------------------------------------------------------------
+# Fair value estimators
+# ---------------------------------------------------------------------------
+
+def osmium_fair(_depth, _memory) -> float:
+    return float(OSMIUM_FAIR)
+
+
+def pepper_fair(depth, memory: dict, tick_count: int) -> float:
+    """Pepper fair = filtered mid + small drift bias.
+
+    The drift bias models the fact that over one tick the mid moves
+    about +0.1 ticks on average, so we should be willing to pay that
+    much more than the current mid when buying.
     """
-    mp = _microprice(order_depth)
-    ema = state_memory.get("pepper_ema")
-    if math.isnan(mp):
-        return ema if ema is not None else 0.0
+    filt = _filtered_mid(depth, PEPPER_VOLUME_FILTER)
+    best_bid, _, best_ask, _ = _best_levels(depth)
 
-    if ema is None:
-        ema = mp
+    if filt is not None:
+        base = filt
+    elif best_bid is not None and best_ask is not None:
+        base = (best_bid + best_ask) / 2
+    elif best_bid is not None:
+        base = float(best_bid)
+    elif best_ask is not None:
+        base = float(best_ask)
     else:
-        ema = PEPPER_EMA_ALPHA * mp + (1 - PEPPER_EMA_ALPHA) * ema
-    state_memory["pepper_ema"] = ema
+        base = memory.get("pepper_fair", 0.0)
 
-    last_trade = state_memory.get("pepper_last_trade")
-    if last_trade is not None:
-        # cheap mean reversion: assume today's trade will partially retrace
-        ema = (1 - PEPPER_REVERSION) * ema + PEPPER_REVERSION * (2 * ema - last_trade)
+    bias = min(PEPPER_DRIFT_BIAS * max(tick_count, 0), PEPPER_MAX_DRIFT_BIAS)
+    # We do not stack bias across ticks -- it is just a small "expected
+    # drift over the next tick" correction on top of the current mid.
+    fair = base + PEPPER_DRIFT_BIAS if tick_count > 0 else base
+    memory["pepper_fair"] = fair
+    return fair
 
-    return ema
 
-
-# -------------------------------------------------------------------------
-# Main Trader class expected by the Prosperity runner
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Trader entry-point
+# ---------------------------------------------------------------------------
 
 class Trader:
-    """Entry point the IMC runner calls once per timestamp."""
-
     def run(self, state) -> Tuple[Dict[str, List], int, str]:
-        # Restore any state we persisted on previous calls.
         memory: dict = {}
         if getattr(state, "traderData", None):
             try:
@@ -326,61 +328,43 @@ class Trader:
             except Exception:
                 memory = {}
 
-        # Record the most recent trade of the trending product so that our
-        # fair-value estimator can use it on the next tick.
-        own_trades = getattr(state, "own_trades", {}) or {}
-        market_trades = getattr(state, "market_trades", {}) or {}
-        recent_pepper = []
-        for bucket in (own_trades, market_trades):
-            for t in bucket.get("INTARIAN_PEPPER_ROOT", []) or []:
-                recent_pepper.append(t.price)
-        if recent_pepper:
-            memory["pepper_last_trade"] = sum(recent_pepper) / len(recent_pepper)
+        tick_count = memory.get("tick_count", 0)
+        tick_count += 1
+        memory["tick_count"] = tick_count
 
         result: Dict[str, List] = defaultdict(list)
         positions = getattr(state, "position", {}) or {}
         order_depths = getattr(state, "order_depths", {}) or {}
 
-        # ---- ASH_COATED_OSMIUM ------------------------------------------
-        symbol = "ASH_COATED_OSMIUM"
-        if symbol in order_depths:
-            depth = order_depths[symbol]
-            position = positions.get(symbol, 0)
-            limit = POSITION_LIMIT[symbol]
-            fair = _osmium_fair_value(depth, memory)
+        # ---- OSMIUM: classic market-making around 10_000 --------------
+        if OSMIUM in order_depths:
+            depth = order_depths[OSMIUM]
+            pos = positions.get(OSMIUM, 0)
+            limit = POSITION_LIMIT[OSMIUM]
+            fair = osmium_fair(depth, memory)
 
-            take, buys, sells = _take_orders(
-                symbol, depth, fair, OSMIUM_TAKE_WIDTH, position, limit,
+            take, buys, sells = _take_step(
+                OSMIUM, depth, fair, OSMIUM_TAKE_EDGE, pos, limit,
             )
-            clear, buys, sells = _clear_orders(
-                symbol, depth, fair, position, buys, sells, limit,
+            clear, buys, sells = _clear_step(
+                OSMIUM, depth, fair, OSMIUM_CLEAR_WIDTH,
+                pos, buys, sells, limit,
             )
-            make = _make_orders(
-                symbol, depth, fair, OSMIUM_MAKE_EDGE,
-                position, buys, sells, limit, OSMIUM_JOIN_EDGE,
+            make = _make_step(
+                OSMIUM, depth, fair,
+                OSMIUM_DISREGARD_EDGE, OSMIUM_JOIN_EDGE,
+                pos, buys, sells, limit, OSMIUM_SOFT_LIMIT,
             )
-            result[symbol].extend(take + clear + make)
+            result[OSMIUM].extend(take + clear + make)
 
-        # ---- INTARIAN_PEPPER_ROOT ---------------------------------------
-        symbol = "INTARIAN_PEPPER_ROOT"
-        if symbol in order_depths:
-            depth = order_depths[symbol]
-            position = positions.get(symbol, 0)
-            limit = POSITION_LIMIT[symbol]
-            fair = _pepper_fair_value(depth, memory)
+        # ---- PEPPER: aggressive long ladder --------------------------
+        if PEPPER in order_depths:
+            depth = order_depths[PEPPER]
+            pos = positions.get(PEPPER, 0)
+            limit = POSITION_LIMIT[PEPPER]
+            fair = pepper_fair(depth, memory, tick_count)
+            result[PEPPER].extend(_pepper_orders(depth, fair, pos, limit))
 
-            take, buys, sells = _take_orders(
-                symbol, depth, fair, PEPPER_TAKE_WIDTH, position, limit,
-            )
-            clear, buys, sells = _clear_orders(
-                symbol, depth, fair, position, buys, sells, limit,
-            )
-            make = _make_orders(
-                symbol, depth, fair, PEPPER_MAKE_EDGE,
-                position, buys, sells, limit, join_edge=1.0,
-            )
-            result[symbol].extend(take + clear + make)
-
-        trader_data = json.dumps(memory)
         conversions = 0
+        trader_data = json.dumps(memory)
         return dict(result), conversions, trader_data

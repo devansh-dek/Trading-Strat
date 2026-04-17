@@ -264,10 +264,12 @@ def run_day(prices_path: str, trades_path: str) -> Dict[str, float]:
                     )
 
         # --- Step 2: simulate passive fills from the trade tape ----------
-        # If a public trade printed at a price that is at/through our
-        # resting quote, we assume we got a share of that flow.  This is
-        # the same fill model used by most Prosperity community
-        # backtesters (e.g. Stanford Cardinal writeup).
+        # A resting quote can only be filled if it is at least as
+        # aggressive as the best visible level on its own side of the
+        # book (otherwise the matching engine will cross our competition
+        # first).  When a public print at some price p crosses our quote,
+        # we fill at *our* quoted price -- that is exactly what the IMC
+        # server does when a counterparty lifts/hits our rest order.
         tape = market_trades.get(int(ts), {})
         for sym, orders in resting.items():
             tape_trades = tape.get(sym, [])
